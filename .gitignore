@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Training outputs are regenerated on every run — keep the sample/loss
+# curve committed for a static README preview, but not raw checkpoints
+# (checkpoint.pt is ~10MB+ of tensor data with no reason to live in git).
+outputs/checkpoint.pt
+outputs/train.log
+
+# OS cruft
+.DS_Store
