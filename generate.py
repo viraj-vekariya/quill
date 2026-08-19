@@ -30,6 +30,7 @@ def main():
     p.add_argument("--max_new_tokens", type=int, default=500)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_k", type=int, default=40)
+    p.add_argument("--use_cache", action="store_true", help="use KV-cached generation (faster; requires prompt + max_new_tokens to fit in block_size)")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -44,7 +45,11 @@ def main():
 
     context = torch.tensor([tokenizer.encode(args.prompt)], dtype=torch.long, device=device)
     out_ids = model.generate(
-        context, max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k
+        context,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        use_cache=args.use_cache,
     )[0].tolist()
     print(tokenizer.decode(out_ids))
 
