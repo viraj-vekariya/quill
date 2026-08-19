@@ -31,15 +31,17 @@ tokens ─▶ token_emb + pos_emb ─▶ [ pre-LN block ] x n_layer ─▶ Layer
 - **`quill/block.py`** — pre-LN transformer block (GPT-2-onward convention: normalize
   *before* the sub-layer, not after — keeps gradients well-behaved at depth).
 - **`quill/model.py`** — `GPT`: embeddings, block stack, weight-tied output head,
-  GPT-2-style scaled residual-projection init, `generate()` with temperature/top-k sampling.
+  GPT-2-style scaled residual-projection init, `generate()` with temperature/top-k sampling
+  and an optional KV-cache for faster autoregressive decoding (see below).
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/ -q      # 11 tests: causality, LayerNorm correctness, overfit sanity check
+python -m pytest tests/ -q      # 16 tests: causality, LayerNorm correctness, overfit sanity, KV-cache equivalence
 python train.py                 # ~14 min on Apple Silicon MPS, 3000 iterations
 python generate.py --prompt "ROMEO:"
+python generate.py --prompt "ROMEO:" --use_cache   # same output, faster (see KV-cache below)
 ```
 
 (`./run.sh` / `run.bat` do venv + deps + tests + training in one step.)
@@ -56,7 +58,43 @@ The tests prove the "from scratch" claims rather than just checking the code run
 | `test_model_can_overfit_a_tiny_repeated_sequence` | The single most useful sanity check in ML: a model that can't memorize an 8-token pattern in 200 steps has a bug in forward/backward, no amount of real data will fix it. |
 | `test_lm_head_is_tied_to_token_embedding` | Weight tying is actually wired up (`is`, not just equal-valued). |
 | `test_generate_appends_exactly_max_new_tokens` | Autoregressive generation produces exactly the requested length, tokens in-vocab. |
+| `test_cached_generation_matches_uncached_token_ids` / `..._on_trained_checkpoint` | KV-cached generation produces byte-for-byte identical token IDs to the uncached path — on a random toy model and on the real trained checkpoint — under greedy decoding. |
+| `test_cached_logits_match_uncached_logits_at_each_step` | The cached path's logits at each step match a full from-scratch recompute over the same growing sequence, within float tolerance. |
 | + gradient-flow and shape tests | Every parameter in attention receives a gradient; output shapes match input shapes throughout. |
+
+## KV-cache
+
+`generate()` accepts `use_cache=True` (default `False`, to keep the original
+behavior/API untouched for existing callers). Without it, every new token
+reruns full attention over the *entire* sequence generated so far — quadratic
+work across a generation. With it, `CausalSelfAttention` caches each layer's
+key/value tensors and each new token only computes attention for its one new
+query against the cached history, so per-step cost stops growing with how
+much has already been generated.
+
+Correctness is the part that actually matters here — a caching bug that
+silently produces different tokens would be far worse than no cache at all —
+so it's checked three ways in `tests/test_generation_cache.py`: exact
+token-ID equality under greedy decoding (both on a toy model and on the real
+trained checkpoint), step-level logits closeness against a full recompute,
+and a cache-growth shape check.
+
+Measured with `benchmark_cache.py` against the trained checkpoint (4 layers,
+128-dim, block_size 128) generating 127 tokens on Apple Silicon MPS,
+best-of-5: **1.2x** wall-clock speedup. That's real but modest — expected at
+this scale: `block_size=128` means even the "quadratic" uncached path is only
+recomputing attention over a couple hundred positions at most, so there isn't
+much redundant work to eliminate yet, and MPS's per-op dispatch overhead cuts
+into the savings when each cached step is a smaller op. The win from KV-
+caching grows with context length; it would be far more pronounced at the
+several-thousand-token contexts real LLMs run at, which is exactly why every
+production inference stack uses one.
+
+**Limitation:** unlike the uncached path (which silently slides its context
+window over the most recent `block_size` tokens once a generation outgrows
+it), the cached path has no sliding-window eviction — `len(prompt) +
+max_new_tokens` must fit within `block_size`, or `generate(..., use_cache=
+True)` raises an assertion rather than producing quietly-wrong output.
 
 ## Training run (this repo's actual numbers)
 
@@ -114,9 +152,9 @@ step 2999 — this is an undertrained-by-design demo, not a converged model.
   train on a laptop in minutes, not to produce publication-quality text. The
   architecture (attention, LayerNorm, blocks) is what's "from scratch," not
   the scale.
-- **No KV-cache in `generate()`.** Each new token reprocesses the full context
-  window through every layer — fine at `block_size=128`, would need a KV-cache
-  to be usable at production context lengths.
+- **KV-cache has no sliding-window eviction.** `generate(..., use_cache=True)`
+  requires the prompt plus everything generated to fit within `block_size` —
+  see the KV-cache section above.
 - **Dataset:** `data/tinyshakespeare.txt` is the standard "Tiny Shakespeare"
   corpus (public-domain text, commonly redistributed for exactly this kind of
   char-level LM tutorial/benchmark — e.g. Karpathy's char-rnn and nanoGPT both
@@ -133,8 +171,9 @@ quill/
   block.py       pre-LN transformer block (attention + MLP + residuals)
   model.py       GPT: embeddings, block stack, generate()
   dataset.py     random contiguous-window batching
-tests/           causality, LayerNorm-equivalence, overfit sanity check, generation
+tests/           causality, LayerNorm-equivalence, overfit sanity check, generation, KV-cache
 data/            tinyshakespeare.txt
 train.py         full training loop, loss curve, checkpoint
-generate.py      sample from a saved checkpoint
+generate.py      sample from a saved checkpoint (--use_cache for KV-cached decoding)
+benchmark_cache.py   measures real wall-clock cached vs. uncached generation speedup
 ```
