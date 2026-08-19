@@ -33,7 +33,13 @@ class TransformerBlock(nn.Module):
         self.ln2 = LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, past_kv=None, use_cache: bool = False):
+        if use_cache:
+            attn_out, present_kv = self.attn(self.ln1(x), past_kv=past_kv, use_cache=True)
+            x = x + attn_out
+            x = x + self.mlp(self.ln2(x))
+            return x, present_kv
+
         x = x + self.attn(self.ln1(x))
         x = x + self.mlp(self.ln2(x))
         return x
