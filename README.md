@@ -38,10 +38,11 @@ tokens ─▶ token_emb + pos_emb ─▶ [ pre-LN block ] x n_layer ─▶ Layer
 
 ```bash
 pip install -r requirements.txt
-python -m pytest tests/ -q      # 16 tests: causality, LayerNorm correctness, overfit sanity, KV-cache equivalence
+python -m pytest tests/ -q      # 23 tests: causality, LayerNorm correctness, overfit sanity, KV-cache equivalence, top-p sampling
 python train.py                 # ~14 min on Apple Silicon MPS, 3000 iterations
 python generate.py --prompt "ROMEO:"
 python generate.py --prompt "ROMEO:" --use_cache   # same output, faster (see KV-cache below)
+python generate.py --prompt "ROMEO:" --top_p 0.9   # nucleus sampling, composes with --top_k
 ```
 
 (`./run.sh` / `run.bat` do venv + deps + tests + training in one step.)
@@ -60,6 +61,8 @@ The tests prove the "from scratch" claims rather than just checking the code run
 | `test_generate_appends_exactly_max_new_tokens` | Autoregressive generation produces exactly the requested length, tokens in-vocab. |
 | `test_cached_generation_matches_uncached_token_ids` / `..._on_trained_checkpoint` | KV-cached generation produces byte-for-byte identical token IDs to the uncached path — on a random toy model and on the real trained checkpoint — under greedy decoding. |
 | `test_cached_logits_match_uncached_logits_at_each_step` | The cached path's logits at each step match a full from-scratch recompute over the same growing sequence, within float tolerance. |
+| `test_top_p_never_produces_an_empty_candidate_set` | Across p from 0.0 to 1.0 on random logits, the nucleus is never empty — a filtering bug here would either crash `softmax` on an all -inf row or silently degrade to always-argmax. |
+| `test_low_top_p_with_greedy_equivalent_seed_still_matches_argmax_choice` | A vanishingly small `top_p` collapses the nucleus to exactly the single most likely token, so sampling from it must equal `argmax` — checked directly, not assumed. |
 | + gradient-flow and shape tests | Every parameter in attention receives a gradient; output shapes match input shapes throughout. |
 
 ## KV-cache
@@ -95,6 +98,60 @@ window over the most recent `block_size` tokens once a generation outgrows
 it), the cached path has no sliding-window eviction — `len(prompt) +
 max_new_tokens` must fit within `block_size`, or `generate(..., use_cache=
 True)` raises an assertion rather than producing quietly-wrong output.
+
+## Sampling: top-k and top-p
+
+`generate()` supports temperature, top-k, and now nucleus (top-p) sampling,
+and they compose: top-k (if set) narrows the vocabulary to the k
+highest-probability tokens first, then top-p (if set) further narrows
+*that* set to the smallest prefix whose cumulative probability covers `p`,
+before the final softmax/sample. Either can be used alone or disabled
+(`None`).
+
+The nucleus construction (`GPT._top_p_filter`) sorts logits descending,
+takes a cumulative sum of their softmax probabilities, and masks every
+token past the point where that cumulative sum first covers `p`. The token
+that pushes the sum past `p` is always kept, so the candidate set is never
+empty — even a `top_p` near 0 on a sharply peaked distribution still keeps
+the single dominant token rather than masking everything to `-inf` and
+handing `softmax` a degenerate row. `tests/test_top_p.py` checks this
+directly (peaked-distribution collapse, empty-set guard across the full
+`[0, 1]` range, and composition with top-k), not just "the shapes work out."
+
+Real output from the trained checkpoint (`generate.py --prompt "ROMEO:"
+--max_new_tokens 100`, no fixed seed, so exact text varies run to run —
+these are actual single runs, not cherry-picked):
+
+```
+top_k=40 only:
+ROMEO:
+Go; for not plaur not to me; thou she his holder a
+Were a this that of'er diver that trive coase at
+
+top_p=0.9 (top_k disabled):
+ROMEO:
+And the do come was now you the dayspt of you,
+Make with have the mark'd will your much to so thee;
+
+top_p=0.5 (tighter nucleus):
+ROMEO:
+The so man his her be of my be a brother,
+And stranger and the the shall shall have the heart
+And b
+```
+
+Honestly: at this model's scale (4 layers, 128-dim, character-level, ~14 min
+of training) none of these read as meaningfully more "coherent" than the
+others — the model hasn't learned enough structure for sampling strategy to
+be the dominant factor in output quality yet. The one real, repeatable
+pattern across several runs: the tighter `top_p=0.5` nucleus visibly repeats
+short words more often ("the the shall shall") than `top_p=0.9`, which
+tracks with nucleus sampling's known tradeoff (a smaller candidate set is
+more prone to locking onto a locally-likely loop) — but this is a
+small-model, short-training-run observation, not a claim that top-p
+"fixes" quality here. Its real value is the same as in production LLM
+serving: a tunable diversity/reliability knob, demonstrated correct on a
+project small enough to verify by hand.
 
 ## Training run (this repo's actual numbers)
 
@@ -171,9 +228,9 @@ quill/
   block.py       pre-LN transformer block (attention + MLP + residuals)
   model.py       GPT: embeddings, block stack, generate()
   dataset.py     random contiguous-window batching
-tests/           causality, LayerNorm-equivalence, overfit sanity check, generation, KV-cache
+tests/           causality, LayerNorm-equivalence, overfit sanity check, generation, KV-cache, top-p sampling
 data/            tinyshakespeare.txt
 train.py         full training loop, loss curve, checkpoint
-generate.py      sample from a saved checkpoint (--use_cache for KV-cached decoding)
+generate.py      sample from a saved checkpoint (--use_cache for KV-cached decoding, --top_p for nucleus sampling)
 benchmark_cache.py   measures real wall-clock cached vs. uncached generation speedup
 ```

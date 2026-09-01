@@ -30,6 +30,7 @@ def main():
     p.add_argument("--max_new_tokens", type=int, default=500)
     p.add_argument("--temperature", type=float, default=0.8)
     p.add_argument("--top_k", type=int, default=40)
+    p.add_argument("--top_p", type=float, default=None, help="nucleus sampling threshold (composes with --top_k)")
     p.add_argument("--use_cache", action="store_true", help="use KV-cached generation (faster; requires prompt + max_new_tokens to fit in block_size)")
     args = p.parse_args()
 
@@ -49,6 +50,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
         use_cache=args.use_cache,
     )[0].tolist()
     print(tokenizer.decode(out_ids))
