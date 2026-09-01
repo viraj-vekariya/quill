@@ -103,13 +103,46 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-    def _next_token(self, logits: torch.Tensor, temperature: float, top_k: int | None) -> torch.Tensor:
+    def _next_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: int | None,
+        top_p: float | None = None,
+    ) -> torch.Tensor:
         logits = logits[:, -1, :] / temperature
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
             logits[logits < v[:, [-1]]] = float("-inf")
+        if top_p is not None:
+            logits = self._top_p_filter(logits, top_p)
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
+
+    @staticmethod
+    def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+        """Nucleus filtering: keep the smallest prefix of sorted-descending
+        tokens whose cumulative probability mass covers top_p, masking every
+        other token to -inf before the caller's softmax/sample.
+
+        Composes with top_k (applied first in _next_token, so top_p only
+        ever narrows an already top_k-restricted set when both are given).
+        The token that first pushes the cumulative sum past top_p is always
+        kept -- the candidate set is never empty, even for a small top_p on
+        a sharply peaked distribution where the single top token alone
+        exceeds it.
+        """
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+        # Removable once the cumulative mass *before* this token already
+        # covers top_p -- i.e. the previous token was already enough.
+        sorted_remove = (cumulative_probs - sorted_probs) > top_p
+        sorted_remove[..., 0] = False  # never drop the single most likely token
+
+        remove_mask = torch.zeros_like(sorted_remove).scatter(1, sorted_indices, sorted_remove)
+        return logits.masked_fill(remove_mask, float("-inf"))
 
     @torch.no_grad()
     def generate(
@@ -118,6 +151,7 @@ class GPT(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor:
         """Autoregressively sample max_new_tokens continuations of idx.
@@ -139,7 +173,7 @@ class GPT(nn.Module):
             for _ in range(max_new_tokens):
                 idx_cond = idx[:, -self.config.block_size:]
                 logits, _ = self(idx_cond)
-                next_id = self._next_token(logits, temperature, top_k)
+                next_id = self._next_token(logits, temperature, top_k, top_p)
                 idx = torch.cat((idx, next_id), dim=1)
             return idx
 
@@ -150,11 +184,11 @@ class GPT(nn.Module):
         )
 
         logits, _, past_kv = self(idx, use_cache=True)
-        next_id = self._next_token(logits, temperature, top_k)
+        next_id = self._next_token(logits, temperature, top_k, top_p)
         idx = torch.cat((idx, next_id), dim=1)
 
         for _ in range(max_new_tokens - 1):
             logits, _, past_kv = self(next_id, past_kv=past_kv, use_cache=True)
-            next_id = self._next_token(logits, temperature, top_k)
+            next_id = self._next_token(logits, temperature, top_k, top_p)
             idx = torch.cat((idx, next_id), dim=1)
         return idx
